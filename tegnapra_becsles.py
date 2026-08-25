@@ -6,7 +6,14 @@ import numpy as np
 from wattler_tools import wdb, wattler_drive, wattler_chat
 
 # --- CONFIGURATION & PATHS ---
-BASE_DIR = Path(__file__).parent
+if '__file__' in globals():
+    WORKING_DIR = Path(__file__).resolve().parent
+else:
+    WORKING_DIR = Path.cwd()
+
+SERVER_TMP_DIR = Path('/home/waut/tmp')
+BASE_DIR = SERVER_TMP_DIR if SERVER_TMP_DIR.is_dir() else WORKING_DIR
+
 FOGAZ_PATH = BASE_DIR / "fogaz.csv"
 ED_PATH = BASE_DIR / "ed.csv"
 TIGAZ_PATH = BASE_DIR / "tigaz.xlsx"
@@ -14,7 +21,7 @@ TIGAZ_PATH = BASE_DIR / "tigaz.xlsx"
 # Google Drive Shared Folder ID containing the raw files
 SHARED_DRIVE_FOLDER_ID = "1XHfnTEHt3GKgS8S-R2f0wcSpb8pP__yG"
 
-CHAT_ID = "TESZT"
+CHAT_ID = "VILLANY"
 
 OUTPUT_ORAS_POD = BASE_DIR / "oras_pod.csv"
 OUTPUT_NOMINALT = BASE_DIR / "nominalt.csv"
@@ -23,8 +30,8 @@ OUTPUT_PORTFOLIO = BASE_DIR / "portfolio.csv"
 # Target gas day is always D-1 (yesterday)
 TARGET_GAS_DAY = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
 
-# Retry settings: 10 minutes wait between checks
-RETRY_DELAY_SECONDS = 600  # 10 minutes
+# Retry settings: 5 minutes wait between checks
+RETRY_DELAY_SECONDS = 300  # 5 minutes
 MAX_RETRIES = 1  # Number of retries before falling back completely
 
 
