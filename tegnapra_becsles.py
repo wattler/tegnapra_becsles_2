@@ -21,7 +21,7 @@ TIGAZ_PATH = BASE_DIR / "tigaz.xlsx"
 # Google Drive Shared Folder ID containing the raw files
 SHARED_DRIVE_FOLDER_ID = "1XHfnTEHt3GKgS8S-R2f0wcSpb8pP__yG"
 
-CHAT_ID = "VILLANY"
+CHAT_ID = "GAZ"
 
 OUTPUT_ORAS_POD = BASE_DIR / "oras_pod.csv"
 OUTPUT_NOMINALT = BASE_DIR / "nominalt.csv"
