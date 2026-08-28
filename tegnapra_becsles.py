@@ -235,7 +235,8 @@ def fetch_pod_mapping() -> pd.DataFrame:
     sql_pod = """
     SELECT DISTINCT 
         CAST(id_POD AS CHAR) AS id_pod, 
-        CAST(POD_azonosito AS CHAR) AS POD 
+        CAST(POD_azonosito AS CHAR) AS POD,
+        namecpty_contr AS cegnev
     FROM 
         W2_sites_pods.POD_list_m0
     """
@@ -362,13 +363,17 @@ def fetch_all_files_with_retry() -> tuple[dict[str, pd.DataFrame], list[str], li
             else:
                 missing_sources.append(name.upper())
 
-        # If we found at least one file or reached maximum retries, proceed
-        if found_sources or attempt == MAX_RETRIES:
+        # Check if ALL 3 files were found
+        all_files_present = len(missing_sources) == 0
+
+        # Proceed ONLY if all files exist OR we finished our retry attempt
+        if all_files_present or attempt == MAX_RETRIES:
             return sources_dict, found_sources, missing_sources
 
-        # No files found on this attempt; send message, wait x mins, then retry
+        # Missing files detected; send message with exact missing files, wait, then retry
         retry_minutes = RETRY_DELAY_SECONDS // 60
-        wait_msg = f"*DATA MISSING*: No valid Gas Day `{TARGET_GAS_DAY}` files found on Drive (FŐGÁZ, ÉD, TIGÁZ). Retrying in {retry_minutes} minutes..."
+        missing_str = ", ".join(missing_sources)
+        wait_msg = f"*DATA MISSING*: Missing file(s) for Gas Day `{TARGET_GAS_DAY}`: `{missing_str}`. Retrying in {retry_minutes} minutes..."
         print(f"[TIME RELAY] {wait_msg}")
         try:
             wattler_chat.send_chat(CHAT_ID, wait_msg)
@@ -379,6 +384,124 @@ def fetch_all_files_with_retry() -> tuple[dict[str, pd.DataFrame], list[str], li
 
     return sources_dict, found_sources, missing_sources
 
+def calculate_mvm_imputed_ratios(fogaz_path: Path) -> dict:
+    """
+    Reads the raw MVM/FŐGÁZ CSV and builds a lookup mapping POD ID string -> Imputation Ratio (float).
+    Replicates Excel: COUNTIFS(..., "igen") / MAX(COUNTIFS(...), 1)
+    """
+    if not fogaz_path.exists():
+        return {}
+
+    try:
+        df = load_csv_with_encoding(fogaz_path)
+        df.columns = df.columns.astype(str).str.strip()
+
+        # Find POD and Adatpótlás columns
+        pod_cols = [c for c in df.columns if "POD" in c]
+        adatpotlas_cols = [c for c in df.columns if "Adatpótlás" in c or "adatpotlas" in c.lower()]
+
+        if not pod_cols or not adatpotlas_cols:
+            return {}
+
+        pod_col = pod_cols[0]
+        adat_col = adatpotlas_cols[0]
+
+        df["POD_clean"] = df[pod_col].astype(str).str.strip()
+        df["is_imputed"] = df[adat_col].astype(str).str.strip().str.lower() == "igen"
+
+        # Calculate counts per POD string
+        stats = df.groupby("POD_clean").agg(
+            total_count=("is_imputed", "count"),
+            imputed_count=("is_imputed", "sum")
+        )
+
+        stats["ratio"] = stats["imputed_count"] / np.maximum(stats["total_count"], 1)
+        return stats["ratio"].to_dict()
+
+    except Exception as e:
+        print(f"[IMPUTATION WARN] Failed to calculate MVM imputation ratios: {e}")
+        return {}
+
+
+def get_excel_imputation_string(pod_str: str, mvm_ratios: dict) -> str:
+    """
+    Replicates Excel:
+    =IF(MID(POD,4,2)="11", "-", COUNTIFS('MVM'!C:C, POD, 'MVM'!I:I, "igen") / MAX(COUNTIFS('MVM'!C:C, POD), 1))
+    """
+    pod_str = str(pod_str).strip()
+
+    # 1. Check MID(POD, 4, 2) == "11" (ÉD check)
+    if len(pod_str) >= 5 and pod_str[3:5] == "11":
+        return "-"
+
+    # 2. If POD is in MVM export data, return formatted percentage
+    if pod_str in mvm_ratios:
+        ratio = mvm_ratios[pod_str]
+        return f"{ratio * 100:.1f}%"
+
+    # 3. If POD is not in MVM (e.g. Tigáz), Excel COUNTIFS returns 0 / MAX(0, 1) = 0.0%
+    return "0.0%"
+
+
+def generate_top_bottom_elteres_table(portfolio_df: pd.DataFrame, pod_map_df: pd.DataFrame, fogaz_path: Path) -> pd.DataFrame:
+    """
+    Generates a 10-row side-by-side Top 10 (túlnominálás) and Bottom 10 (alulnominálás) summary table.
+    """
+    # 1. Merge POD string and company name into portfolio using pod_map_df
+    df = pd.merge(portfolio_df, pod_map_df[["id_pod", "POD", "cegnev"]], on="id_pod", how="left")
+    df["cegnev"] = df["cegnev"].fillna("Ismeretlen")
+
+    # 2. Calculate Eltérés (Nominated - Export/Fogyasztás)
+    df["eltereskwh"] = np.where(
+        df["source"] == "tavmert",
+        df["nomvol_kwh"] - df["total_kwh_fogyasztas"],
+        np.nan
+    )
+
+    valid_diffs = df.dropna(subset=["eltereskwh"]).copy()
+    if valid_diffs.empty:
+        print("[SUMMARY WARN] No valid távmért differences available for Top/Bottom table.")
+        return pd.DataFrame()
+
+    # 3. Calculate MVM Imputation Ratios dictionary
+    mvm_ratios = calculate_mvm_imputed_ratios(fogaz_path)
+
+    # 4. Apply Excel formula logic to get exact string
+    valid_diffs["potolt_adatok_aranya"] = valid_diffs["POD"].apply(
+        lambda pod: get_excel_imputation_string(pod, mvm_ratios)
+    )
+
+    valid_diffs["tulnominalas"] = valid_diffs["eltereskwh"].round().astype(int)
+
+    # 5. Top 10 (Túlnominálás) & Bottom 10 (Alulnominálás)
+    top_10 = (
+        valid_diffs.nlargest(10, "tulnominalas")[["tulnominalas", "cegnev", "potolt_adatok_aranya"]]
+        .reset_index(drop=True)
+    )
+
+    bottom_10 = (
+        valid_diffs.nsmallest(10, "tulnominalas")[["tulnominalas", "cegnev", "potolt_adatok_aranya"]]
+        .reset_index(drop=True)
+    )
+    bottom_10.rename(columns={"tulnominalas": "alulnominalas"}, inplace=True)
+
+    # Pad empty rows if fewer than 10 rows exist
+    for idx in range(len(top_10), 10):
+        top_10.loc[idx] = ["", "", ""]
+    for idx in range(len(bottom_10), 10):
+        bottom_10.loc[idx] = ["", "", ""]
+
+    # 6. Build Side-by-Side Summary DataFrame
+    summary_table = pd.DataFrame({
+        "túlnominálás": top_10["tulnominalas"],
+        "cégnév (túl)": top_10["cegnev"],
+        "pótolt adatok aránya (túl)": top_10["potolt_adatok_aranya"],
+        "alulnominálás": bottom_10["alulnominalas"],
+        "cégnév (alul)": bottom_10["cegnev"],
+        "pótolt adatok aránya (alul)": bottom_10["potolt_adatok_aranya"],
+    })
+
+    return summary_table
 
 # --- MAIN EXECUTION ---
 def main():
@@ -387,22 +510,6 @@ def main():
     # 1. RETRY / FETCH FILES FROM DRIVE
     sources_dict, found_sources, missing_sources = fetch_all_files_with_retry()
 
-    # Inform Chat if some (or all) files were missing after checks
-    if missing_sources and found_sources:
-        status_msg = f"*PARTIAL DATA*: Found files for `{', '.join(found_sources)}`. Missing files: `{', '.join(missing_sources)}`. Using nominated values for missing sources."
-        print(f"[INFO] {status_msg}")
-        try:
-            wattler_chat.send_chat(CHAT_ID, status_msg)
-        except Exception as e:
-            print(f"[CHAT ERROR] {e}")
-    elif not found_sources:
-        status_msg = f"*NO DATA FOUND*: Could not retrieve any raw files for Gas Day `{TARGET_GAS_DAY}`. Falling back strictly to nominated values."
-        print(f"[INFO] {status_msg}")
-        try:
-            wattler_chat.send_chat(CHAT_ID, status_msg)
-        except Exception as e:
-            print(f"[CHAT ERROR] {e}")
-
     # Combine available távmért data frames
     combined_df = pd.concat(list(sources_dict.values()), ignore_index=True)
 
@@ -410,6 +517,8 @@ def main():
     nom_df = fetch_nominated_volumes(TARGET_GAS_DAY)
     nom_df.to_csv(OUTPUT_NOMINALT, index=False, encoding="utf-8-sig")
     print(f"[SUCCESS] Saved Nominált data ({len(nom_df)} rows) to: {OUTPUT_NOMINALT}")
+
+    pod_map_df = None  # Initialize to keep scope clean
 
     if combined_df.empty:
         oras_pod_df = pd.DataFrame(columns=["id_pod", "pod", "total_kwh_fogyasztas"])
@@ -489,6 +598,22 @@ def main():
     output_portfolio_df.to_csv(OUTPUT_PORTFOLIO, index=False, encoding="utf-8-sig")
     print(f"[SUCCESS] Consolidated Portfolio ({len(output_portfolio_df)} rows) saved to: {OUTPUT_PORTFOLIO}")
 
+    # --- NEW: TOP 10 TÚLNOMINÁLÁS & ALULNOMINÁLÁS SUMMARY TABLE ---
+    if pod_map_df is None:
+        pod_map_df = fetch_pod_mapping()
+
+    summary_elteres_df = generate_top_bottom_elteres_table(portfolio_df, pod_map_df, FOGAZ_PATH)
+
+    if not summary_elteres_df.empty:
+        output_top_bottom_path = BASE_DIR / "top_bottom_elteres.csv"
+        summary_elteres_df.to_csv(output_top_bottom_path, index=False, encoding="utf-8-sig")
+
+        print("\n" + "=" * 80)
+        print(" TOP 10 TÚLNOMINÁLÁS & ALULNOMINÁLÁS SUMMARY")
+        print("=" * 80)
+        print(summary_elteres_df.to_string(index=False))
+        print("=" * 80 + "\n")
+
     # 4. CALCULATION & EXCEL EQUIVALENT SUMMARY
     total_tavmert = float(oras_pod_df["total_kwh_fogyasztas"].sum()) if not oras_pod_df.empty else 0.0
     total_nominalt = float(nom_df["nomvol_kwh"].sum()) if not nom_df.empty else 0.0
@@ -524,6 +649,9 @@ def main():
     position_type = " SHORT" if net_sum < 0 else " LONG"
 
     summary_string = f"Reggeli becslés: PF {pf_k}K, balance: {balance_k}K{position_type}"
+    if missing_sources:
+        missing_str = ", ".join(missing_sources)
+        summary_string += f" (Hiányzó adatok: {missing_str})"
 
     print("\n" + "=" * 65)
     print(" POSITION BREAKDOWN (kWh)")
@@ -536,7 +664,7 @@ def main():
     print("-" * 65)
     print(f"  PORTFOLIO = J616+(H616-I616)+H617:           {portfolio:>15,.2f} kWh")
     print("=" * 65)
-    print(f"  Osszes forras (sum_long):                     {sum_long:>15,.2f} kWh")
+    print(f"  Osszes forras (sum_long):                    {sum_long:>15,.2f} kWh")
     print(f"  LPFS:                                        {lpfs:>15,.2f} kWh")
     print(f"  Betár:                                       {betar:>15,.2f} kWh")
     print("-" * 65)
