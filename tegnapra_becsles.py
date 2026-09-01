@@ -21,7 +21,10 @@ TIGAZ_PATH = BASE_DIR / "tigaz.xlsx"
 # Google Drive Shared Folder ID containing the raw files
 SHARED_DRIVE_FOLDER_ID = "1XHfnTEHt3GKgS8S-R2f0wcSpb8pP__yG"
 
-CHAT_ID = "GAZ"
+CHAT_ID = "TESZT"
+
+# Toggle sending chat messages (set to False to disable all sends)
+SEND_CHAT = False
 
 OUTPUT_ORAS_POD = BASE_DIR / "oras_pod.csv"
 OUTPUT_NOMINALT = BASE_DIR / "nominalt.csv"
@@ -244,24 +247,36 @@ def fetch_pod_mapping() -> pd.DataFrame:
         return pd.read_sql(sql_pod, con=conn)
 
 
-def fetch_multipliers() -> pd.DataFrame:
+def fetch_multipliers() -> tuple:
     engine = wdb.get_sqla_engine()
-    sql_multipliers = """
-    SELECT DISTINCT 
-        CAST(pg.POD_azonosito AS CHAR) AS POD,
-        ca.gcv_conv_15fok AS szorzo
-    FROM 
-        W2_sites_pods.POD_gas AS pg
-    JOIN 
-        W7_gas_alloc.conversionvalue AS ca
-    ON 
-        pg.id_kiadpont = ca.id_kiadp
-    WHERE 
-        ca.gasmonth = DATE_FORMAT(LAST_DAY(CURDATE() - INTERVAL 1 MONTH), '%Y-%m-01')
-    ORDER BY POD
-    """
-    with engine.connect() as conn:
-        return pd.read_sql(sql_multipliers, con=conn)
+
+    # Try previous months (-1, -2, ..., -12) until we find conversion multipliers.
+    # If none are found, return an empty DataFrame and let the caller apply a global fallback.
+    max_lookback_months = 12
+    for months_back in range(1, max_lookback_months + 1):
+        sql_multipliers = f"""
+        SELECT DISTINCT
+            CAST(pg.POD_azonosito AS CHAR) AS POD,
+            ca.gcv_conv_15fok AS szorzo
+        FROM
+            W2_sites_pods.POD_gas AS pg
+        JOIN
+            W7_gas_alloc.conversionvalue AS ca
+        ON
+            pg.id_kiadpont = ca.id_kiadp
+        WHERE
+            ca.gasmonth = DATE_FORMAT(LAST_DAY(CURDATE() - INTERVAL {months_back} MONTH), '%Y-%m-01')
+        ORDER BY POD
+        """
+        with engine.connect() as conn:
+            df = pd.read_sql(sql_multipliers, con=conn)
+
+        if df is not None and not df.empty:
+            print(f"[MULTIPLIER INFO] Using multipliers from {months_back} month(s) ago")
+            return df, months_back
+
+    print(f"[MULTIPLIER WARN] No multipliers found in last {max_lookback_months} months; caller should fallback to global default")
+    return pd.DataFrame(columns=["POD", "szorzo"]), 0
 
 
 def fetch_nominated_volumes(target_gas_day: str) -> pd.DataFrame:
@@ -375,10 +390,13 @@ def fetch_all_files_with_retry() -> tuple[dict[str, pd.DataFrame], list[str], li
         missing_str = ", ".join(missing_sources)
         wait_msg = f"*DATA MISSING*: Missing file(s) for Gas Day `{TARGET_GAS_DAY}`: `{missing_str}`. Retrying in {retry_minutes} minutes..."
         print(f"[TIME RELAY] {wait_msg}")
-        try:
-            wattler_chat.send_chat(CHAT_ID, wait_msg)
-        except Exception as e:
-            print(f"[CHAT ERROR] Failed to send chat message: {e}")
+        if SEND_CHAT:
+            try:
+                wattler_chat.send_chat(CHAT_ID, wait_msg)
+            except Exception as e:
+                print(f"[CHAT ERROR] Failed to send chat message: {e}")
+        else:
+            print("[CHAT DISABLED] Skipping send_chat for missing files")
 
         time.sleep(RETRY_DELAY_SECONDS)
 
@@ -519,12 +537,13 @@ def main():
     print(f"[SUCCESS] Saved Nominált data ({len(nom_df)} rows) to: {OUTPUT_NOMINALT}")
 
     pod_map_df = None  # Initialize to keep scope clean
+    multiplier_issue_msg = ""
 
     if combined_df.empty:
         oras_pod_df = pd.DataFrame(columns=["id_pod", "pod", "total_kwh_fogyasztas"])
     else:
         pod_map_df = fetch_pod_mapping()
-        multipliers_df = fetch_multipliers()
+        multipliers_df, multipliers_months_back = fetch_multipliers()
 
         # Determine a safe fallback multiplier when conversion values are missing.
         # Prefer the mean of available multipliers, otherwise fall back to a sensible default (10.7).
@@ -546,6 +565,17 @@ def main():
         filtered_df = pd.merge(filtered_df, multipliers_df, on="POD", how="left")
         # Fill missing multipliers with the computed safe fallback (avoid multiplying by 0)
         filtered_df["szorzo"] = filtered_df["szorzo"].fillna(default_szorzo)
+
+        # Decide whether to add a multiplier diagnostic to final summary
+        try:
+            mb = int(multipliers_months_back)
+        except Exception:
+            mb = 0
+
+        if mb == 0:
+            multiplier_issue_msg = f"No multipliers found; used fallback {default_szorzo:.2f} kWh/m3"
+        elif mb != 1:
+            multiplier_issue_msg = f"Using multipliers from {mb} month(s) ago"
 
         # Calculate kWh consumption
         filtered_df["fogyasztas_kwh"] = filtered_df["fogyasztas_m3"] * filtered_df["szorzo"]
@@ -662,6 +692,9 @@ def main():
     if missing_sources:
         missing_str = ", ".join(missing_sources)
         summary_string += f" (Hiányzó adatok: {missing_str})"
+    # Append multiplier diagnostics only when there was an issue (not the preferred 1-month lookup)
+    if multiplier_issue_msg:
+        summary_string += f" | {multiplier_issue_msg}"
 
     print("\n" + "=" * 65)
     print(" POSITION BREAKDOWN (kWh)")
@@ -684,11 +717,14 @@ def main():
     print("=" * 65 + "\n")
 
     # 5. GOOGLE CHAT FINAL SUMMARY DELIVERY
-    try:
-        wattler_chat.send_chat(CHAT_ID, summary_string)
-        print(f"[CHAT] Final summary delivered to {CHAT_ID} space.")
-    except Exception as e:
-        print(f"[CHAT ERROR] Failed to send final chat message: {e}")
+    if SEND_CHAT:
+        try:
+            wattler_chat.send_chat(CHAT_ID, summary_string)
+            print(f"[CHAT] Final summary delivered to {CHAT_ID} space.")
+        except Exception as e:
+            print(f"[CHAT ERROR] Failed to send final chat message: {e}")
+    else:
+        print("[CHAT DISABLED] Final summary not sent (SEND_CHAT=False)")
 
     return summary_string
 
