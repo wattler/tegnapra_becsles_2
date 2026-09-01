@@ -526,6 +526,15 @@ def main():
         pod_map_df = fetch_pod_mapping()
         multipliers_df = fetch_multipliers()
 
+        # Determine a safe fallback multiplier when conversion values are missing.
+        # Prefer the mean of available multipliers, otherwise fall back to a sensible default (10.7).
+        if multipliers_df is None or multipliers_df.empty:
+            print("[MULTIPLIER WARN] No conversion multipliers found; using fallback 10.7 kWh/m3")
+            default_szorzo = 10.7
+        else:
+            mean_vals = multipliers_df["szorzo"].dropna()
+            default_szorzo = float(mean_vals.mean()) if not mean_vals.empty else 10.7
+
         # Step 1: Join files POD -> id_pod via POD_list_m0
         merged_df = pd.merge(combined_df, pod_map_df, on="POD", how="inner")
 
@@ -535,7 +544,8 @@ def main():
 
         # Step 3: Join multiplier (szorzo) where POD matches
         filtered_df = pd.merge(filtered_df, multipliers_df, on="POD", how="left")
-        filtered_df["szorzo"] = filtered_df["szorzo"].fillna(0.0)
+        # Fill missing multipliers with the computed safe fallback (avoid multiplying by 0)
+        filtered_df["szorzo"] = filtered_df["szorzo"].fillna(default_szorzo)
 
         # Calculate kWh consumption
         filtered_df["fogyasztas_kwh"] = filtered_df["fogyasztas_m3"] * filtered_df["szorzo"]
@@ -548,9 +558,9 @@ def main():
         )
 
         # SPECIAL OVERRIDE FOR EXCEPTION POD
+        # SPECIAL OVERRIDE: apply nominal value only for the specific exceptional POD
         special_pod_mask = (
             (oras_pod_df["pod"] == "39N050777442000Z")
-            | (oras_pod_df["pod"] == "28210101")
             | (oras_pod_df["id_pod"] == "28210101")
         )
 
