@@ -1,15 +1,26 @@
 from datetime import datetime, date, timedelta
-from pathlib import Path
 import time
+from pathlib import Path
+import warnings
 import pandas as pd
 import numpy as np
-from wattler_tools import wdb, wattler_drive, wattler_chat
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 
 # --- CONFIGURATION & PATHS ---
 if '__file__' in globals():
     WORKING_DIR = Path(__file__).resolve().parent
 else:
     WORKING_DIR = Path.cwd()
+
+# Try importing custom wattler tools with fallbacks
+try:
+    from wattler_tools import wdb, wattler_drive, wattler_chat 
+    WATTLER_TOOLS_AVAILABLE = True
+except ImportError:
+    warnings.warn("Could not import wattler_tools. SQL, Drive, and Chat features will operate with mock fallbacks.")
+    WATTLER_TOOLS_AVAILABLE = False
+warnings.filterwarnings('ignore')
 
 SERVER_TMP_DIR = Path('/home/waut/tmp')
 BASE_DIR = SERVER_TMP_DIR if SERVER_TMP_DIR.is_dir() else WORKING_DIR
@@ -23,8 +34,9 @@ SHARED_DRIVE_FOLDER_ID = "1XHfnTEHt3GKgS8S-R2f0wcSpb8pP__yG"
 
 CHAT_ID = "TESZT"
 
-# Toggle sending chat messages (set to False to disable all sends)
-SEND_CHAT = False
+# Toggles
+SEND_CHAT = True
+UPLOAD_TO_DRIVE = True
 
 OUTPUT_ORAS_POD = BASE_DIR / "oras_pod.csv"
 OUTPUT_NOMINALT = BASE_DIR / "nominalt.csv"
@@ -168,17 +180,35 @@ def load_and_filter_standard_csv(file_path: Path, source_name: str, folder_id: s
     if adatpotlas_cols:
         adat_col = adatpotlas_cols[0]
         is_nem = valid_df[adat_col].astype(str).str.strip().str.lower() == "nem"
+        valid_df["is_nem"] = is_nem
+
+        # Compute mean of measured ('nem') rows grouped by Gyáriszám
         valid_nem_df = valid_df[is_nem]
-        
         nem_means = valid_nem_df.groupby(gyari_col)["raw_m3"].mean()
         mapped_means = valid_df[gyari_col].map(nem_means)
 
-        valid_df["fogyasztas_m3"] = np.where(is_nem, valid_df["raw_m3"], mapped_means)
+        # Decide which PODs are fully imputed at the GYÁRISZÁM-group level.
+        # For each (POD, Gyáriszám) determine if there exists any measured ('nem') row.
+        grp_has_measured = (
+            valid_df.groupby(["POD", gyari_col])["is_nem"].any().reset_index(name="has_measured")
+        )
 
-        fully_imputed_pods = valid_df[valid_df["fogyasztas_m3"].isna()]["POD"].unique()
-        if len(fully_imputed_pods) > 0:
-            print(f"[{source_name.upper()}] Dropped {len(fully_imputed_pods)} POD(s) with 100% 'igen' rows: {list(fully_imputed_pods)}")
+        # For each POD, check if any of its Gyáriszám groups have measured rows.
+        pod_has_any_measured = (
+            grp_has_measured.groupby("POD")["has_measured"].any()
+        )
+
+        # PODs to drop are those with NO measured rows in any Gyáriszám group
+        fully_imputed_pods = pod_has_any_measured[~pod_has_any_measured].index.tolist()
+        if fully_imputed_pods:
+            print(f"[{source_name.upper()}] Dropped {len(fully_imputed_pods)} POD(s) with 100% 'igen' rows across all Gyáriszám groups: {fully_imputed_pods}")
             valid_df = valid_df[~valid_df["POD"].isin(fully_imputed_pods)].copy()
+
+        # For remaining pods: recompute mapped means after any row drops so indices align,
+        # then replace imputed rows with the Gyáriszám mean when available. If a group has
+        # no measured mean, fill with 0 so the POD still contributes via other groups.
+        mapped_means = valid_df[gyari_col].map(nem_means).fillna(0)
+        valid_df["fogyasztas_m3"] = np.where(valid_df["is_nem"], valid_df["raw_m3"], mapped_means)
     else:
         valid_df["fogyasztas_m3"] = valid_df["raw_m3"]
 
@@ -461,7 +491,79 @@ def get_excel_imputation_string(pod_str: str, mvm_ratios: dict) -> str:
     return "0.0%"
 
 
-def generate_top_bottom_elteres_table(portfolio_df: pd.DataFrame, pod_map_df: pd.DataFrame, fogaz_path: Path) -> pd.DataFrame:
+def calculate_mvm_imputed_ratios(file_paths: list[Path], target_gas_day: str) -> dict:
+    """
+    Reads MVM exports (FŐGÁZ + ÉD CSVs), filters for TARGET_GAS_DAY,
+    and calculates a combined POD ID -> Imputation Ratio dictionary.
+    """
+    all_dfs = []
+
+    for path in file_paths:
+        if not path or not path.exists():
+            continue
+
+        try:
+            df = load_csv_with_encoding(path)
+            df.columns = df.columns.astype(str).str.strip()
+
+            # Filter for target gas day
+            target_col_candidates = [c for c in df.columns if "Gáznap" in c and "tól" in c]
+            if target_col_candidates:
+                df["calculated_gasday"] = parse_gasday_from_interval_start(df[target_col_candidates[0]])
+                df = df[df["calculated_gasday"] == target_gas_day].copy()
+
+            if not df.empty:
+                all_dfs.append(df)
+
+        except Exception as e:
+            print(f"[IMPUTATION WARN] Failed to load {path.name}: {e}")
+
+    if not all_dfs:
+        print("[IMPUTATION WARN] No MVM data loaded for ratio calculation.")
+        return {}
+
+    # Concatenate FŐGÁZ and ÉD dataframes
+    combined_df = pd.concat(all_dfs, ignore_index=True)
+
+    pod_cols = [c for c in combined_df.columns if "POD" in c]
+    adatpotlas_cols = [c for c in combined_df.columns if "Adatpótlás" in c or "adatpotlas" in c.lower()]
+
+    if not pod_cols or not adatpotlas_cols:
+        return {}
+
+    pod_col = pod_cols[0]
+    adat_col = adatpotlas_cols[0]
+
+    combined_df["POD_clean"] = combined_df[pod_col].astype(str).str.strip().str.upper()
+    combined_df["is_imputed"] = combined_df[adat_col].astype(str).str.strip().str.lower() == "igen"
+
+    # Calculate ratios per POD
+    stats = combined_df.groupby("POD_clean").agg(
+        total_count=("is_imputed", "count"),
+        imputed_count=("is_imputed", "sum")
+    )
+
+    stats["ratio"] = stats["imputed_count"] / np.maximum(stats["total_count"], 1)
+    return stats["ratio"].to_dict()
+
+
+def get_excel_imputation_string(pod_str: str, mvm_ratios: dict) -> str:
+    pod_str = str(pod_str).strip().upper()
+
+    # 1. Tigáz PODs (39N11...) do not have MVM imputation exports
+    if pod_str.startswith("39N11"):
+        return "-"
+
+    # 2. Look up in combined MVM (FŐGÁZ 39N06 + ÉD 39N05) ratios
+    if pod_str in mvm_ratios:
+        ratio = mvm_ratios[pod_str]
+        return f"{ratio * 100:.1f}%"
+
+    # 3. Fallback for non-MVM or missing PODs
+    return "-"
+
+
+def generate_top_bottom_elteres_table(portfolio_df: pd.DataFrame, pod_map_df: pd.DataFrame, fogaz_path: Path, ed_path: Path) -> pd.DataFrame:
     """
     Generates a 10-row side-by-side Top 10 (túlnominálás) and Bottom 10 (alulnominálás) summary table.
     """
@@ -482,7 +584,7 @@ def generate_top_bottom_elteres_table(portfolio_df: pd.DataFrame, pod_map_df: pd
         return pd.DataFrame()
 
     # 3. Calculate MVM Imputation Ratios dictionary
-    mvm_ratios = calculate_mvm_imputed_ratios(fogaz_path)
+    mvm_ratios = calculate_mvm_imputed_ratios([fogaz_path, ed_path], TARGET_GAS_DAY)
 
     # 4. Apply Excel formula logic to get exact string
     valid_diffs["potolt_adatok_aranya"] = valid_diffs["POD"].apply(
@@ -503,13 +605,13 @@ def generate_top_bottom_elteres_table(portfolio_df: pd.DataFrame, pod_map_df: pd
     )
     bottom_10.rename(columns={"tulnominalas": "alulnominalas"}, inplace=True)
 
-    # Pad empty rows if fewer than 10 rows exist
+    # 6. Pad empty rows if fewer than 10 rows exist
     for idx in range(len(top_10), 10):
         top_10.loc[idx] = ["", "", ""]
     for idx in range(len(bottom_10), 10):
         bottom_10.loc[idx] = ["", "", ""]
 
-    # 6. Build Side-by-Side Summary DataFrame
+    # 7. Build Side-by-Side Summary DataFrame
     summary_table = pd.DataFrame({
         "túlnominálás": top_10["tulnominalas"],
         "cégnév (túl)": top_10["cegnev"],
@@ -520,6 +622,185 @@ def generate_top_bottom_elteres_table(portfolio_df: pd.DataFrame, pod_map_df: pd
     })
 
     return summary_table
+
+def export_styled_summary_image(summary_table: pd.DataFrame, output_path: str = "alul_felul_nominalas.png"):
+    """
+    Renders the Top/Bottom 10 summary dataframe into a beautifully formatted PNG image
+    with color gradients for nominations and imputation ratios.
+    """
+    if summary_table.empty:
+        print("[WARN] Summary table is empty. Skipping image export.")
+        return
+
+    df = summary_table.copy()
+    rows, cols = df.shape
+
+    # 1. Setup figure dimensions and axis
+    fig, ax = plt.subplots(figsize=(14, 0.6 * (rows + 1.5)))
+    ax.axis("off")
+
+    # 2. Extract and parse numeric values for color mapping
+    def parse_int(val):
+        try:
+            return abs(int(val))
+        except (ValueError, TypeError):
+            return 0
+
+    def parse_pct(val):
+        try:
+            val_str = str(val).replace("%", "").strip()
+            return float(val_str)
+        except (ValueError, TypeError):
+            return 0.0
+
+    tul_vals = [parse_int(x) for x in df["túlnominálás"]]
+    alul_vals = [parse_int(x) for x in df["alulnominálás"]]
+    pct_tul_vals = [parse_pct(x) for x in df["pótolt adatok aránya (túl)"]]
+    pct_alul_vals = [parse_pct(x) for x in df["pótolt adatok aránya (alul)"]]
+
+    max_tul = max(tul_vals) if max(tul_vals) > 0 else 1
+    max_alul = max(alul_vals) if max(alul_vals) > 0 else 1
+    max_pct = max(max(pct_tul_vals), max(pct_alul_vals))
+    max_pct = max_pct if max_pct > 0 else 100.0
+
+    # Color Maps
+    cmap_red = plt.cm.Reds      # Túlnominálás (Over)
+    cmap_blue = plt.cm.Blues    # Alulnominálás (Under)
+    cmap_orange = plt.cm.YlOrRd # Pótolt adatok (Imputation)
+
+    # 3. Build cell color matrix
+    cell_colors = []
+    for r in range(rows):
+        row_colors = []
+        for c, col_name in enumerate(df.columns):
+            val = df.iloc[r, c]
+
+            # Alternating background default (light zebra striping)
+            default_bg = "#f9f9f9" if r % 2 == 0 else "#ffffff"
+
+            if col_name == "túlnominálás" and val != "":
+                norm = parse_int(val) / max_tul
+                # Gentle red tint scale
+                color = mcolors.to_hex(cmap_red(0.1 + 0.5 * norm))
+            elif col_name == "alulnominálás" and val != "":
+                norm = parse_int(val) / max_alul
+                # Gentle blue tint scale
+                color = mcolors.to_hex(cmap_blue(0.1 + 0.5 * norm))
+            elif "pótolt adatok aránya" in col_name and val not in ["-", "0.0%", ""]:
+                pct = parse_pct(val)
+                norm = pct / max_pct
+                # Soft yellow-orange tint scale for non-zero ratios
+                color = mcolors.to_hex(cmap_orange(0.15 + 0.5 * norm))
+            else:
+                color = default_bg
+
+            row_colors.append(color)
+        cell_colors.append(row_colors)
+
+    # 4. Render Table
+    table = ax.table(
+        cellText=df.values,
+        colLabels=df.columns,
+        cellColours=cell_colors,
+        cellLoc="center",
+        loc="center"
+    )
+
+    # 5. Fine-tune Styling & Fonts
+    table.auto_set_font_size(False)
+    table.set_fontsize(9.5)
+    table.scale(1.0, 1.8)  # Increase vertical cell padding
+
+    # Header Row Styling
+    header_color_tul = "#d9534f"   # Deep Red Header
+    header_color_alul = "#0275d8"  # Deep Blue Header
+
+    for c, col_name in enumerate(df.columns):
+        cell = table[0, c]
+        cell.set_text_props(weight="bold", color="white")
+        cell.set_height(0.08)
+
+        if "túl" in col_name:
+            cell.set_facecolor(header_color_tul)
+        else:
+            cell.set_facecolor(header_color_alul)
+
+    # Make data text bold where appropriate
+    for r in range(rows):
+        for c in range(cols):
+            cell = table[r + 1, c]
+            val = df.iloc[r, c]
+            if c in [0, 3]: # Nominations columns
+                cell.get_text().set_weight("bold")
+
+    plt.title("TOP 10 TÚLNOMINÁLÁS & ALULNOMINÁLÁS SUMMARY", fontsize=12, fontweight="bold", pad=15)
+    plt.tight_layout()
+
+    # 6. Save Image
+    plt.savefig(output_path, dpi=250, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[SUCCESS] Summary image saved to: {output_path}")
+
+
+def helper_upload_to_drive(filename: str) -> str | None:
+    """Upload a file to Google Drive and return a view URL (or None).
+
+    Uses `wattler_drive.upload_file_to_google_drive` which may return True/False
+    or an ID/dict depending on implementation. To reliably obtain a Drive link
+    we upload then lookup the file ID in the target folder.
+    """
+    if not (UPLOAD_TO_DRIVE and WATTLER_TOOLS_AVAILABLE):
+        return None
+    try:
+        # Normalize path
+        file_path = Path(filename)
+        if not file_path.is_absolute():
+            file_path = BASE_DIR / filename
+
+        if not file_path.exists():
+            print(f" -> [DRIVE ERROR] File to upload not found: {file_path}")
+            return None
+
+        print(f" -> [DRIVE INFO] Uploading file to Drive: {file_path}")
+        res = wattler_drive.upload_file_to_google_drive(str(file_path), SHARED_DRIVE_FOLDER_ID, overwrite=True, create_new_if_exists=False)
+        print(f" -> [DRIVE DEBUG] Upload response: {res}")
+
+        # If the upload helper returns a boolean True/False, we need to locate the file id
+        if isinstance(res, bool):
+            if not res:
+                print(f" -> [DRIVE ERROR] Upload reported failure for: {file_path}")
+                return None
+            # Upload succeeded; try to resolve the file ID by name
+            try:
+                found = wattler_drive.get_file_ids_from_google_drive(file_name_pattern=file_path.name, google_folder_id=SHARED_DRIVE_FOLDER_ID, search_subfolders=False)
+                if not found:
+                    # fallback search by stem in case upload created a suffixed name
+                    found = wattler_drive.get_file_ids_from_google_drive(file_name_pattern=file_path.stem, google_folder_id=SHARED_DRIVE_FOLDER_ID, search_subfolders=False)
+                if found:
+                    file_id = found[0].get("id")
+                    print(f" -> [DRIVE INFO] Resolved uploaded file ID: {file_id}")
+                    return f"https://drive.google.com/file/d/{file_id}/view"
+                else:
+                    print(f" -> [DRIVE WARN] Upload succeeded but could not locate file id for: {file_path.name}")
+                    return None
+            except Exception as e:
+                print(f" -> [DRIVE ERROR] Could not resolve uploaded file id: {e}")
+                return None
+
+        # If upload returned dict or string-like id, handle those as well
+        if isinstance(res, dict):
+            file_id = res.get("id")
+            if file_id:
+                return f"https://drive.google.com/file/d/{file_id}/view"
+        if isinstance(res, str):
+            # assume it's a file id
+            return f"https://drive.google.com/file/d/{res}/view"
+
+        print(f" -> [DRIVE WARN] Upload returned unexpected response: {res}")
+        return None
+    except Exception as e:
+        print(f" -> [DRIVE ERROR] Upload failed for {filename}: {e}")
+        return None
 
 # --- MAIN EXECUTION ---
 def main():
@@ -642,10 +923,10 @@ def main():
     if pod_map_df is None:
         pod_map_df = fetch_pod_mapping()
 
-    summary_elteres_df = generate_top_bottom_elteres_table(portfolio_df, pod_map_df, FOGAZ_PATH)
+    summary_elteres_df = generate_top_bottom_elteres_table(portfolio_df, pod_map_df, FOGAZ_PATH, ED_PATH)
 
     if not summary_elteres_df.empty:
-        output_top_bottom_path = BASE_DIR / "top_bottom_elteres.csv"
+        output_top_bottom_path = BASE_DIR / "alul_felul_nominalas.csv"
         summary_elteres_df.to_csv(output_top_bottom_path, index=False, encoding="utf-8-sig")
 
         print("\n" + "=" * 80)
@@ -653,6 +934,17 @@ def main():
         print("=" * 80)
         print(summary_elteres_df.to_string(index=False))
         print("=" * 80 + "\n")
+
+        # Export image & upload ONLY the image to Drive
+        image_filename = "alul_felul_nominalas.png"
+        export_styled_summary_image(summary_elteres_df, image_filename)
+        summary_image_url = helper_upload_to_drive(image_filename)
+
+        # Print or format into your final chat message
+        if summary_image_url:
+            print(f"\n[CHAT MESSAGE LINK] Alul/Felul Nominalas Summary Image:\n{summary_image_url}")
+        else:
+            print("\n[INFO] Summary image created locally, but Drive upload was skipped or failed.")
 
     # 4. CALCULATION & EXCEL EQUIVALENT SUMMARY
     total_tavmert = float(oras_pod_df["total_kwh_fogyasztas"].sum()) if not oras_pod_df.empty else 0.0
@@ -691,10 +983,12 @@ def main():
     summary_string = f"Reggeli becslés: PF {pf_k}K, balance: {balance_k}K{position_type}"
     if missing_sources:
         missing_str = ", ".join(missing_sources)
-        summary_string += f" (Hiányzó adatok: {missing_str})"
+        summary_string += f"\nHiányzó adatok: {missing_str}"
     # Append multiplier diagnostics only when there was an issue (not the preferred 1-month lookup)
     if multiplier_issue_msg:
-        summary_string += f" | {multiplier_issue_msg}"
+        summary_string += f"\n{multiplier_issue_msg}"
+    if summary_image_url:
+        summary_string += f"\nAlul/Felül Nominálás: {summary_image_url}"
 
     print("\n" + "=" * 65)
     print(" POSITION BREAKDOWN (kWh)")
