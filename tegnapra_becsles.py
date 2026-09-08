@@ -35,8 +35,11 @@ SHARED_DRIVE_FOLDER_ID = "1XHfnTEHt3GKgS8S-R2f0wcSpb8pP__yG"
 CHAT_ID = "TESZT"
 
 # Toggles
-SEND_CHAT = True
+SEND_CHAT = False
 UPLOAD_TO_DRIVE = True
+
+# Filenames
+SUMMARY_IMAGE_NAME = "alul_felul_nominalas.png"
 
 OUTPUT_ORAS_POD = BASE_DIR / "oras_pod.csv"
 OUTPUT_NOMINALT = BASE_DIR / "nominalt.csv"
@@ -623,14 +626,14 @@ def generate_top_bottom_elteres_table(portfolio_df: pd.DataFrame, pod_map_df: pd
 
     return summary_table
 
-def export_styled_summary_image(summary_table: pd.DataFrame, output_path: str = "alul_felul_nominalas.png"):
+def export_styled_summary_image(summary_table: pd.DataFrame, output_path: str | Path | None = None) -> str:
     """
     Renders the Top/Bottom 10 summary dataframe into a beautifully formatted PNG image
     with color gradients for nominations and imputation ratios.
     """
     if summary_table.empty:
         print("[WARN] Summary table is empty. Skipping image export.")
-        return
+        return ""
 
     df = summary_table.copy()
     rows, cols = df.shape
@@ -737,9 +740,24 @@ def export_styled_summary_image(summary_table: pd.DataFrame, output_path: str = 
     plt.tight_layout()
 
     # 6. Save Image
-    plt.savefig(output_path, dpi=250, bbox_inches="tight")
+    # Resolve output path: default to BASE_DIR/<filename> when None or relative string provided
+    if output_path is None:
+        file_path = BASE_DIR / SUMMARY_IMAGE_NAME
+    else:
+        file_path = Path(output_path)
+        if not file_path.is_absolute():
+            file_path = BASE_DIR / file_path
+
+    # Ensure parent directory exists
+    try:
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    plt.savefig(file_path, dpi=250, bbox_inches="tight")
     plt.close(fig)
-    print(f"[SUCCESS] Summary image saved to: {output_path}")
+    print(f"[SUCCESS] Summary image saved to: {file_path}")
+    return str(file_path)
 
 
 def helper_upload_to_drive(filename: str) -> str | None:
@@ -936,9 +954,11 @@ def main():
         print("=" * 80 + "\n")
 
         # Export image & upload ONLY the image to Drive
-        image_filename = "alul_felul_nominalas.png"
-        export_styled_summary_image(summary_elteres_df, image_filename)
-        summary_image_url = helper_upload_to_drive(image_filename)
+        image_filename = SUMMARY_IMAGE_NAME
+        saved_image_path = export_styled_summary_image(summary_elteres_df, image_filename)
+        summary_image_url = None
+        if saved_image_path:
+            summary_image_url = helper_upload_to_drive(saved_image_path)
 
         # Print or format into your final chat message
         if summary_image_url:
