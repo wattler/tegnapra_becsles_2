@@ -35,7 +35,7 @@ SHARED_DRIVE_FOLDER_ID = "1XHfnTEHt3GKgS8S-R2f0wcSpb8pP__yG"
 CHAT_ID = "GAZ"
 
 # Toggles
-SEND_CHAT = False
+SEND_CHAT = True
 UPLOAD_TO_DRIVE = True
 
 # Filenames
